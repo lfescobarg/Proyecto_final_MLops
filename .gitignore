@@ -3,3 +3,7 @@
 
 # Datos
 data/processed/dataset.parquet
+
+# MLflow
+mlruns/
+mlflow.db
