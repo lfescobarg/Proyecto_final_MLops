@@ -1,0 +1,5 @@
+# Entorno virtual
+.venv/
+
+# Datos
+data/processed/dataset.parquet
