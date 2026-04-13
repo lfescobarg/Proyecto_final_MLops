@@ -1,8 +1,11 @@
 # Entorno virtual
 .venv/
+__pycache__/
+*.pyc
 
 # Datos
 data/processed/dataset.parquet
+model.pkl 
 
 # MLflow
 mlruns/
