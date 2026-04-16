@@ -1,36 +1,43 @@
 #!/usr/bin/env python
-# coding: utf-8
+# -*- coding: utf-8 -*-
 
 """
 Bank Marketing Experiment Tracking with Optuna and MLflow
 
-This Prefect flow orchestrates the complete ML pipeline for bank marketing classification:
-1. Load and preprocess data
-2. Feature engineering
-3. Train/test split
-4. Configure preprocessing pipelines
-5. Hyperparameter optimization (HPO) with Optuna for multiple models:
-   - Logistic Regression
-   - Random Forest
-   - XGBoost
-6. Track experiments with MLflow
-7. Generate artifacts and reports
+Complete ML pipeline orchestration for bank marketing classification:
+- Data loading and preprocessing
+- Feature engineering
+- Train/test split
+- Preprocessing pipelines
+- Hyperparameter optimization (HPO) with Optuna for:
+  * Logistic Regression
+  * Random Forest
+  * XGBoost
+- Experiment tracking with MLflow
+- Report generation
+
+Usage:
+    python flow.py --n-trials 10
+    or
+    prefect deploy flow.py
 """
 
 import os
-import pickle
+import json
 import logging
 from pathlib import Path
 from typing import Tuple, Optional, Dict
-import json
 
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
 import mlflow
+import optuna
 
-# Preprocesamiento y Modelado
+# ============================================================================
+# Imports: Scikit-learn & Preprocessing
+# ============================================================================
 from sklearn.model_selection import train_test_split, StratifiedKFold
 from sklearn.pipeline import Pipeline as SklearnPipeline
 from sklearn.compose import ColumnTransformer
@@ -45,34 +52,107 @@ from sklearn.metrics import (
 from xgboost import XGBClassifier
 from category_encoders import TargetEncoder
 
-# Imbalanced learning
+# ============================================================================
+# Imports: Imbalanced Learning & Hyperparameter Optimization
+# ============================================================================
 from imblearn.pipeline import Pipeline
-from imblearn.over_sampling import SMOTE
 from imblearn.under_sampling import RandomUnderSampler
 
-# Hyperparameter optimization
-import optuna
-
-# Prefect
+# ============================================================================
+# Imports: Prefect
+# ============================================================================
 from prefect import task, flow, get_run_logger
-from prefect.artifacts import create_table_artifact, create_markdown_artifact
+from prefect.artifacts import create_markdown_artifact
 
-# Setup logging
+# ============================================================================
+# Setup Logging
+# ============================================================================
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
-def setup_mlflow(experiment_name: str = "bank-marketing-experiments"):
-    """Setup MLflow with proper error handling."""
-    mlflow_uri = os.getenv("MLFLOW_TRACKING_URI", "http://127.0.0.1:5001")
+# ============================================================================
+# SECTION 1: CONFIGURATION & CONSTANTS
+# ============================================================================
+
+class Config:
+    """Configuration for bank marketing experiment tracking."""
     
+    # MLflow
+    MLFLOW_TRACKING_URI = os.getenv("MLFLOW_TRACKING_URI", "http://127.0.0.1:5001")
+    MLFLOW_BACKEND_STORE = "sqlite:///mlflow.db"
+    
+    # Project paths
+    PROJECT_ROOT = Path(__file__).parent.parent
+    DATA_PATHS = [
+        PROJECT_ROOT / "notebooks" / "data" / "processed" / "dataset.parquet",
+        PROJECT_ROOT / "data" / "processed" / "dataset.parquet",
+        PROJECT_ROOT / "notebooks" / "02-Experiment-Tracking" / "data" / "processed" / "dataset.parquet",
+        Path.cwd() / "data" / "processed" / "dataset.parquet",
+    ]
+    
+    # Feature engineering
+    AGE_BINS = [18, 30, 45, 60, 100]
+    AGE_LABELS = ['young', 'adult', 'mid', 'senior']
+    
+    # Features lists
+    NUMERIC_FEATURES = ['age', 'balance', 'campaign_log', 'pdays_clean', 'previous']
+    CATEGORICAL_FEATURES = ['job', 'marital', 'education', 'contact', 'season', 'poutcome']
+    BINARY_FEATURES = ['housing', 'loan', 'prev_success']
+    ALL_FEATURES = NUMERIC_FEATURES + CATEGORICAL_FEATURES + BINARY_FEATURES
+    
+    # Data split
+    TEST_SIZE = 0.2
+    RANDOM_STATE = 42
+    
+    # Preprocessing
+    NUMERIC_IMPUTER_STRATEGY = "median"
+    CATEGORICAL_IMPUTER_FILL_VALUE = "Unknown"
+    TARGET_ENCODER_SMOOTHING = 10
+    
+    # HPO: Logistic Regression
+    LR_C_RANGE = (1e-3, 10.0)
+    LR_MAX_ITER_OPTIONS = [500, 1000]
+    
+    # HPO: Random Forest
+    RF_N_ESTIMATORS_OPTIONS = [200, 300, 500]
+    RF_MAX_DEPTH_OPTIONS = [5, 10, 15]
+    
+    # HPO: XGBoost
+    XGB_N_ESTIMATORS_OPTIONS = [200, 300, 500]
+    XGB_LEARNING_RATE_OPTIONS = [0.01, 0.05, 0.1]
+    XGB_MAX_DEPTH_OPTIONS = [3, 5, 7]
+    XGB_SUBSAMPLE_OPTIONS = [0.8, 1.0]
+    
+    # Threshold optimization
+    THRESHOLD_STEPS = 60
+    MIN_PRECISION_FBETA = 0.18
+    FBETA_VALUE = 1.5
+    
+    # Experiments
+    EXPERIMENT_NAMES = {
+        "lr": "bank-marketing-lr-optuna",
+        "rf": "bank-marketing-rf-optuna",
+        "xgb": "bank-marketing-xgb-optuna",
+        "main": "bank-marketing-experiments"
+    }
+    
+    DEFAULT_N_TRIALS = 3
+
+
+# ============================================================================
+# SECTION 2: UTILITY FUNCTIONS
+# ============================================================================
+
+def setup_mlflow(experiment_name: str = "bank-marketing-experiments") -> None:
+    """Setup MLflow with proper error handling."""
     try:
-        mlflow.set_tracking_uri(mlflow_uri)
+        mlflow.set_tracking_uri(Config.MLFLOW_TRACKING_URI)
         mlflow.search_experiments()
-        logger.info(f"Connected to MLflow at: {mlflow_uri}")
+        logger.info(f"Connected to MLflow at: {Config.MLFLOW_TRACKING_URI}")
     except Exception as e:
-        logger.warning(f"Failed to connect to {mlflow_uri}: {e}")
-        mlflow.set_tracking_uri("sqlite:///mlflow.db")
+        logger.warning(f"Failed to connect to {Config.MLFLOW_TRACKING_URI}: {e}")
+        mlflow.set_tracking_uri(Config.MLFLOW_BACKEND_STORE)
 
     try:
         mlflow.set_experiment(experiment_name)
@@ -81,49 +161,104 @@ def setup_mlflow(experiment_name: str = "bank-marketing-experiments"):
         raise
 
 
+def find_dataset_path() -> str:
+    """Find dataset in predefined locations."""
+    for path in Config.DATA_PATHS:
+        if path.exists():
+            logger.info(f"Found dataset at: {path}")
+            return str(path)
+    
+    raise FileNotFoundError(
+        f"Dataset not found. Searched in:\n" + 
+        "\n".join(str(p) for p in Config.DATA_PATHS)
+    )
+
+
+def season_mapper(month: str) -> str:
+    """Map month to season."""
+    if month in ['dec', 'jan', 'feb']:
+        return 'winter'
+    elif month in ['mar', 'apr', 'may']:
+        return 'spring'
+    elif month in ['jun', 'jul', 'aug']:
+        return 'summer'
+    else:
+        return 'fall'
+
+
+def find_best_threshold_fbeta(
+    y_true: pd.Series,
+    y_proba: np.ndarray,
+    beta: float = Config.FBETA_VALUE,
+    min_precision: float = Config.MIN_PRECISION_FBETA,
+    pos_label: str = "yes"
+) -> Tuple[float, float, dict]:
+    """Find best threshold optimizing F-beta metric."""
+    thresholds = np.linspace(0.1, 0.9, Config.THRESHOLD_STEPS)
+    best_threshold = 0.5
+    best_score = -1
+    best_metrics = {"precision": 0.0, "recall": 0.0, "f1": 0.0}
+
+    for t in thresholds:
+        y_pred = np.where(y_proba >= t, pos_label, "no" if pos_label == "yes" else 0)
+        precision = precision_score(y_true, y_pred, pos_label=pos_label, zero_division=0)
+        recall = recall_score(y_true, y_pred, pos_label=pos_label, zero_division=0)
+        f1 = f1_score(y_true, y_pred, pos_label=pos_label, zero_division=0)
+
+        denominator = (beta**2 * precision) + recall
+        f_beta = ((1 + beta**2) * precision * recall / denominator) if denominator > 0 else 0.0
+
+        if precision >= min_precision and f_beta > best_score:
+            best_score = f_beta
+            best_threshold = t
+            best_metrics = {"precision": precision, "recall": recall, "f1": f1}
+
+    # Fallback if min_precision constraint not met
+    if best_score < 0:
+        for t in thresholds:
+            y_pred = np.where(y_proba >= t, pos_label, "no" if pos_label == "yes" else 0)
+            precision = precision_score(y_true, y_pred, pos_label=pos_label, zero_division=0)
+            recall = recall_score(y_true, y_pred, pos_label=pos_label, zero_division=0)
+            f1 = f1_score(y_true, y_pred, pos_label=pos_label, zero_division=0)
+
+            denominator = (beta**2 * precision) + recall
+            f_beta = ((1 + beta**2) * precision * recall / denominator) if denominator > 0 else 0.0
+
+            if f_beta > best_score:
+                best_score = f_beta
+                best_threshold = t
+                best_metrics = {"precision": precision, "recall": recall, "f1": f1}
+
+    return best_threshold, best_score, best_metrics
+
+
+# ============================================================================
+# SECTION 3: PREFECT TASKS - DATA PIPELINE
+# ============================================================================
+
 @task(name="load_and_preprocess_data", description="Load and preprocess bank marketing data")
 def load_and_preprocess_data(data_path: Optional[str] = None) -> pd.DataFrame:
     """Load raw data and perform initial preprocessing."""
-    logger = get_run_logger()
+    log = get_run_logger()
     
-    # Si no se proporciona ruta, buscar en ubicaciones comunes
     if data_path is None:
-        script_dir = Path(__file__).parent.parent  # Proyecto_final_MLops
-        possible_paths = [
-            script_dir / "notebooks" / "data" / "processed" / "dataset.parquet",
-            script_dir / "data" / "processed" / "dataset.parquet",
-            script_dir / "notebooks" / "02-Experiment-Tracking" / "data" / "processed" / "dataset.parquet",
-            Path.cwd() / "data" / "processed" / "dataset.parquet",
-        ]
-        
-        for path in possible_paths:
-            if path.exists():
-                data_path = str(path)
-                logger.info(f"Found dataset at: {path}")
-                break
-        
-        if data_path is None:
-            raise FileNotFoundError(
-                f"Dataset not found. Searched in:\n" + 
-                "\n".join(str(p) for p in possible_paths)
-            )
+        data_path = find_dataset_path()
     
-    logger.info(f"Loading data from: {data_path}")
+    log.info(f"Loading data from: {data_path}")
     df = pd.read_parquet(data_path)
-    logger.info(f"Loaded {len(df)} records with {len(df.columns)} columns")
+    log.info(f"Loaded {len(df)} records with {len(df.columns)} columns")
     
     return df
 
 
 @task(name="feature_engineering", description="Create feature engineering transformations")
 def feature_engineering(df: pd.DataFrame) -> pd.DataFrame:
-    """Perform feature engineering on the dataset."""
-    logger = get_run_logger()
-    logger.info("Performing feature engineering...")
+    """Perform comprehensive feature engineering."""
+    log = get_run_logger()
+    log.info("Performing feature engineering...")
     
     # Age grouping
-    df['age_group'] = pd.cut(df['age'], bins=[18, 30, 45, 60, 100], 
-                              labels=['young', 'adult', 'mid', 'senior'])
+    df['age_group'] = pd.cut(df['age'], bins=Config.AGE_BINS, labels=Config.AGE_LABELS)
     
     # Campaign log transformation
     df['campaign_log'] = np.log1p(df['campaign'])
@@ -140,81 +275,63 @@ def feature_engineering(df: pd.DataFrame) -> pd.DataFrame:
     df['has_debt'] = ((df['housing'] == 'yes') | (df['loan'] == 'yes')).astype(int)
     
     # Season encoding
-    def season(month):
-        if month in ['dec', 'jan', 'feb']:
-            return 'winter'
-        elif month in ['mar', 'apr', 'may']:
-            return 'spring'
-        elif month in ['jun', 'jul', 'aug']:
-            return 'summer'
-        else:
-            return 'fall'
+    df['season'] = df['month'].apply(season_mapper)
     
-    df['season'] = df['month'].apply(season)
-    
-    logger.info(f"Created 7 new features. Total features: {len(df.columns)}")
+    log.info(f"Created new features. Total columns: {len(df.columns)}")
     
     return df
 
 
 @task(name="prepare_data", description="Prepare train/test split and feature lists")
-def prepare_data(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame, pd.Series, pd.Series, 
-                                             list, list, list]:
+def prepare_data(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame, pd.Series, pd.Series, list, list, list]:
     """Prepare train/test split and classify features."""
-    logger = get_run_logger()
+    log = get_run_logger()
     
     # Data type conversions
     df["pdays_clean"] = df["pdays_clean"].astype(float)
     df["previous"] = df["previous"].astype(float)
     df["campaign_log"] = df["campaign_log"].astype(float)
     
-    # Feature selection
-    features = [
-        'age', 'job', 'marital', 'education', 'balance', 'housing', 'loan',
-        'contact', 'season', 'campaign_log', 'pdays_clean', 'previous',
-        'poutcome', 'prev_success',
-    ]
-    
-    numeric_features = ['age', 'balance', 'campaign_log', 'pdays_clean', 'previous']
-    categorical_features = ['job', 'marital', 'education', 'contact', 'season', 'poutcome']
-    binary_features = ['housing', 'loan', 'prev_success']
-    
     # Train/test split
-    X = df[features]
+    X = df[Config.ALL_FEATURES]
     y = df["y"]
     
     X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=0.2, random_state=42, stratify=y
+        X, y,
+        test_size=Config.TEST_SIZE,
+        random_state=Config.RANDOM_STATE,
+        stratify=y
     )
     
     # Convert binary features to numeric
-    for col in binary_features:
+    for col in Config.BINARY_FEATURES:
         if X_train[col].dtype == "object":
             X_train[col] = X_train[col].map({"yes": 1, "no": 0})
             X_test[col] = X_test[col].map({"yes": 1, "no": 0})
     
-    logger.info(f"Train: {X_train.shape}, Test: {X_test.shape}")
-    logger.info(f"Numeric: {len(numeric_features)}, Categorical: {len(categorical_features)}, Binary: {len(binary_features)}")
+    log.info(f"Train: {X_train.shape}, Test: {X_test.shape}")
     
-    return X_train, X_test, y_train, y_test, numeric_features, categorical_features, binary_features
+    return X_train, X_test, y_train, y_test, Config.NUMERIC_FEATURES, Config.CATEGORICAL_FEATURES, Config.BINARY_FEATURES
 
 
 @task(name="create_preprocessing_pipelines", description="Create sklearn preprocessing pipelines")
-def create_preprocessing_pipelines(numeric_features: list, categorical_features: list):
+def create_preprocessing_pipelines(numeric_features: list, categorical_features: list) -> Tuple:
     """Create preprocessing pipelines for different model types."""
-    logger = get_run_logger()
+    log = get_run_logger()
     
+    # Numeric transformer
     numeric_transformer = SklearnPipeline(steps=[
-        ("imputer", SimpleImputer(strategy="median")),
+        ("imputer", SimpleImputer(strategy=Config.NUMERIC_IMPUTER_STRATEGY)),
         ("scaler", StandardScaler()),
     ])
     
+    # Categorical transformer
     categorical_transformer = SklearnPipeline(steps=[
-        ("imputer", SimpleImputer(strategy="constant", fill_value="Unknown")),
-        ("encoder", TargetEncoder(smoothing=10)),
+        ("imputer", SimpleImputer(strategy="constant", fill_value=Config.CATEGORICAL_IMPUTER_FILL_VALUE)),
+        ("encoder", TargetEncoder(smoothing=Config.TARGET_ENCODER_SMOOTHING)),
     ])
     
-    # LR Preprocessor
+    # LR Preprocessor (with scaling)
     lr_preprocessor = ColumnTransformer(transformers=[
         ("num", numeric_transformer, numeric_features),
         ("cat", categorical_transformer, categorical_features),
@@ -226,64 +343,40 @@ def create_preprocessing_pipelines(numeric_features: list, categorical_features:
         ("cat", categorical_transformer, categorical_features),
     ], remainder="passthrough")
     
-    logger.info("Preprocessing pipelines created successfully")
+    log.info("Preprocessing pipelines created successfully")
     
     return lr_preprocessor, tree_preprocessor
 
 
-@task(name="find_best_threshold_cv", description="Find optimal classification threshold using CV")
-def find_best_threshold_cv(X_train: pd.DataFrame, y_train: pd.Series, model_pipeline, 
-                          n_splits: int = 3) -> float:
-    """Find best threshold using cross-validation on training data (no leakage)."""
-    logger = get_run_logger()
-    
-    skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
-    thresholds = np.linspace(0.2, 0.8, 20)
-    best_threshold = 0.5
-    best_f1 = 0
-
-    for train_idx, val_idx in skf.split(X_train, y_train):
-        X_fold_train, X_fold_val = X_train.iloc[train_idx], X_train.iloc[val_idx]
-        y_fold_train, y_fold_val = y_train.iloc[train_idx], y_train.iloc[val_idx]
-
-        model_pipeline.fit(X_fold_train, y_fold_train)
-        y_proba_val = model_pipeline.predict_proba(X_fold_val)[:, 1]
-
-        for t in thresholds:
-            y_pred_val = np.where(y_proba_val >= t, "yes", "no")
-            f1 = f1_score(y_fold_val, y_pred_val, pos_label="yes")
-            if f1 > best_f1:
-                best_f1 = f1
-                best_threshold = t
-
-    logger.info(f"Best threshold found: {best_threshold:.4f} (F1: {best_f1:.4f})")
-    
-    return best_threshold
-
+# ============================================================================
+# SECTION 4: PREFECT TASKS - MODEL OPTIMIZATION
+# ============================================================================
 
 @task(name="optimize_logistic_regression", description="HPO for Logistic Regression with Optuna")
-def optimize_logistic_regression(X_train: pd.DataFrame, X_test: pd.DataFrame,
-                                y_train: pd.Series, y_test: pd.Series,
-                                lr_preprocessor, numeric_features: list,
-                                categorical_features: list, binary_features: list,
-                                n_trials: int = 10) -> Dict:
-    """Optimize Logistic Regression hyperparameters."""
-    logger = get_run_logger()
-    logger.info("Starting Logistic Regression HPO...")
+def optimize_logistic_regression(
+    X_train: pd.DataFrame, X_test: pd.DataFrame,
+    y_train: pd.Series, y_test: pd.Series,
+    lr_preprocessor,
+    numeric_features: list,
+    categorical_features: list,
+    binary_features: list,
+    n_trials: int = Config.DEFAULT_N_TRIALS
+) -> Dict:
+    """Optimize Logistic Regression hyperparameters using F-beta threshold tuning."""
+    log = get_run_logger()
+    log.info("Starting Logistic Regression HPO...")
     
-    mlflow.set_experiment("bank-marketing-lr-optuna")
+    mlflow.set_experiment(Config.EXPERIMENT_NAMES["lr"])
     mlflow.autolog(log_models=False)
 
     def objective_lr(trial):
-        C = trial.suggest_float("C", 1e-3, 10.0, log=True)
-        max_iter = trial.suggest_categorical("max_iter", [500, 1000])
-
-        logger.info(f"LR trial {trial.number}: C={C:.4f}, max_iter={max_iter}")
+        C = trial.suggest_float("C", Config.LR_C_RANGE[0], Config.LR_C_RANGE[1], log=True)
+        max_iter = trial.suggest_categorical("max_iter", Config.LR_MAX_ITER_OPTIONS)
 
         pipeline_lr = Pipeline(steps=[
             ("preprocessor", lr_preprocessor),
-            ("undersampler", RandomUnderSampler(random_state=42)),
-            ("model", LogisticRegression(C=C, max_iter=max_iter, random_state=42))
+            ("undersampler", RandomUnderSampler(random_state=Config.RANDOM_STATE)),
+            ("model", LogisticRegression(C=C, max_iter=max_iter, class_weight="balanced", random_state=Config.RANDOM_STATE))
         ])
 
         with mlflow.start_run(run_name=f"lr_c{C:.4f}_iter{max_iter}_trial{trial.number}", nested=True) as run:
@@ -291,27 +384,32 @@ def optimize_logistic_regression(X_train: pd.DataFrame, X_test: pd.DataFrame,
             mlflow.set_tag("problem_type", "classification")
             mlflow.set_tag("model_family", "logistic_regression")
             mlflow.set_tag("dataset", "bank_marketing")
+            mlflow.set_tag("selection_logic", f"fbeta_{Config.FBETA_VALUE}")
 
-            best_t = find_best_threshold_cv(X_train, y_train, pipeline_lr)
             pipeline_lr.fit(X_train, y_train)
-            y_proba = pipeline_lr.predict_proba(X_test)[:, 1]
-            y_pred_lr = np.where(y_proba >= best_t, "yes", "no")
+            y_proba_train = pipeline_lr.predict_proba(X_train)[:, 1]
+            best_t, train_f1_5, threshold_metrics = find_best_threshold_fbeta(y_train, y_proba_train)
+            
+            y_proba_test = pipeline_lr.predict_proba(X_test)[:, 1]
+            y_pred_lr = np.where(y_proba_test >= best_t, "yes", "no")
 
             accuracy = accuracy_score(y_test, y_pred_lr)
             precision = precision_score(y_test, y_pred_lr, pos_label="yes")
             recall = recall_score(y_test, y_pred_lr, pos_label="yes")
-            f1_yes = f1_score(y_test, y_pred_lr, pos_label="yes")
-            auc = roc_auc_score(y_test, y_proba)
+            f1 = f1_score(y_test, y_pred_lr, pos_label="yes")
+            auc = roc_auc_score(y_test, y_proba_test)
+            
+            denominator = (Config.FBETA_VALUE**2 * precision) + recall
+            f1_5_test = ((1 + Config.FBETA_VALUE**2) * precision * recall / denominator) if denominator > 0 else 0.0
 
-            mlflow.log_metric("accuracy", accuracy)
-            mlflow.log_metric("precision", precision)
-            mlflow.log_metric("recall", recall)
-            mlflow.log_metric("f1_yes", f1_yes)
-            mlflow.log_metric("auc", auc)
+            mlflow.log_metrics({
+                "accuracy": accuracy, "precision": precision, "recall": recall,
+                "f1": f1, "f1_5": f1_5_test, "auc": auc,
+                "train_f1_5": train_f1_5,
+            })
             mlflow.log_param("best_threshold", best_t)
 
-            logger.info(f"LR trial {trial.number} finished: f1_yes={f1_yes:.4f}, best_threshold={best_t:.4f}")
-            return f1_yes
+            return f1_5_test
 
     study_lr = optuna.create_study(direction="maximize")
     
@@ -319,18 +417,9 @@ def optimize_logistic_regression(X_train: pd.DataFrame, X_test: pd.DataFrame,
         mlflow.set_tag("stage", "hpo")
         study_lr.optimize(objective_lr, n_trials=n_trials)
         
-        top_trials = sorted(
-            [t for t in study_lr.trials if t.value is not None],
-            key=lambda t: t.value, reverse=True
-        )[:5]
-
         best_params = study_lr.best_params
         mlflow.log_params(best_params)
-        mlflow.log_metric("best_f1_yes", study_lr.best_value)
-        
-        logger.info(f"Completed LR HPO with {len(study_lr.trials)} trials")
-        logger.info(f"Best F1 (LR): {study_lr.best_value:.4f}")
-        logger.info(f"Best Params: {best_params}")
+        mlflow.log_metric("best_f1_5", study_lr.best_value)
 
     return {
         "model_type": "Logistic Regression",
@@ -342,36 +431,39 @@ def optimize_logistic_regression(X_train: pd.DataFrame, X_test: pd.DataFrame,
 
 
 @task(name="optimize_random_forest", description="HPO for Random Forest with Optuna")
-def optimize_random_forest(X_train: pd.DataFrame, X_test: pd.DataFrame,
-                          y_train: pd.Series, y_test: pd.Series,
-                          tree_preprocessor, numeric_features: list,
-                          categorical_features: list, binary_features: list,
-                          n_trials: int = 10) -> Dict:
+def optimize_random_forest(
+    X_train: pd.DataFrame, X_test: pd.DataFrame,
+    y_train: pd.Series, y_test: pd.Series,
+    tree_preprocessor,
+    numeric_features: list,
+    categorical_features: list,
+    binary_features: list,
+    n_trials: int = Config.DEFAULT_N_TRIALS
+) -> Dict:
     """Optimize Random Forest hyperparameters."""
-    logger = get_run_logger()
-    logger.info("Starting Random Forest HPO...")
+    log = get_run_logger()
+    log.info("Starting Random Forest HPO...")
     
-    mlflow.set_experiment("bank-marketing-rf-optuna")
+    mlflow.set_experiment(Config.EXPERIMENT_NAMES["rf"])
     mlflow.autolog(log_models=False)
 
     def objective_rf(trial):
-        n_estimators = trial.suggest_categorical("n_estimators", [200, 300, 500])
-        max_depth = trial.suggest_categorical("max_depth", [5, 10, 15])
+        n_estimators = trial.suggest_categorical("n_estimators", Config.RF_N_ESTIMATORS_OPTIONS)
+        max_depth = trial.suggest_categorical("max_depth", Config.RF_MAX_DEPTH_OPTIONS)
 
         pipeline_rf = Pipeline(steps=[
             ("preprocessor", tree_preprocessor),
             ("model", RandomForestClassifier(
                 n_estimators=n_estimators, max_depth=max_depth,
-                class_weight="balanced", random_state=42, n_jobs=-1
+                class_weight="balanced", random_state=Config.RANDOM_STATE, n_jobs=-1
             ))
         ])
-
-        logger.info(f"RF trial {trial.number}: n_estimators={n_estimators}, max_depth={max_depth}")
 
         with mlflow.start_run(run_name=f"rf_n{n_estimators}_depth{max_depth}_trial{trial.number}", nested=True) as run:
             trial.set_user_attr("mlflow_run_id", run.info.run_id)
             mlflow.set_tag("problem_type", "classification")
             mlflow.set_tag("model_family", "random_forest")
+            mlflow.set_tag("dataset", "bank_marketing")
 
             pipeline_rf.fit(X_train, y_train)
             y_pred = pipeline_rf.predict(X_test)
@@ -380,10 +472,8 @@ def optimize_random_forest(X_train: pd.DataFrame, X_test: pd.DataFrame,
             f1 = f1_score(y_test, y_pred, pos_label="yes")
             auc = roc_auc_score(y_test, y_proba)
 
-            mlflow.log_metric("f1_yes", f1)
-            mlflow.log_metric("auc", auc)
+            mlflow.log_metrics({"f1": f1, "auc": auc})
 
-            logger.info(f"RF trial {trial.number} finished: f1_yes={f1:.4f}")
             return f1
 
     study_rf = optuna.create_study(direction="maximize")
@@ -394,11 +484,7 @@ def optimize_random_forest(X_train: pd.DataFrame, X_test: pd.DataFrame,
 
         best_params = study_rf.best_params
         mlflow.log_params(best_params)
-        mlflow.log_metric("best_f1_yes", study_rf.best_value)
-        
-        logger.info(f"Completed RF HPO with {len(study_rf.trials)} trials")
-        logger.info(f"Best F1 (RF): {study_rf.best_value:.4f}")
-        logger.info(f"Best Params: {best_params}")
+        mlflow.log_metric("best_f1", study_rf.best_value)
 
     return {
         "model_type": "Random Forest",
@@ -410,27 +496,31 @@ def optimize_random_forest(X_train: pd.DataFrame, X_test: pd.DataFrame,
 
 
 @task(name="optimize_xgboost", description="HPO for XGBoost with Optuna")
-def optimize_xgboost(X_train: pd.DataFrame, X_test: pd.DataFrame,
-                    y_train: pd.Series, y_test: pd.Series,
-                    tree_preprocessor, numeric_features: list,
-                    categorical_features: list, binary_features: list,
-                    neg_pos_ratio: float, n_trials: int = 10) -> Dict:
+def optimize_xgboost(
+    X_train: pd.DataFrame, X_test: pd.DataFrame,
+    y_train: pd.Series, y_test: pd.Series,
+    tree_preprocessor,
+    numeric_features: list,
+    categorical_features: list,
+    binary_features: list,
+    neg_pos_ratio: float,
+    n_trials: int = Config.DEFAULT_N_TRIALS
+) -> Dict:
     """Optimize XGBoost hyperparameters."""
-    logger = get_run_logger()
-    logger.info("Starting XGBoost HPO...")
+    log = get_run_logger()
+    log.info("Starting XGBoost HPO...")
     
-    # Encode target for XGBoost
     y_train_xgb = y_train.map({"no": 0, "yes": 1})
     y_test_xgb = y_test.map({"no": 0, "yes": 1})
     
-    mlflow.set_experiment("bank-marketing-xgb-optuna")
+    mlflow.set_experiment(Config.EXPERIMENT_NAMES["xgb"])
     mlflow.autolog(log_models=False)
 
     def objective_xgb(trial):
-        n_estimators = trial.suggest_categorical("n_estimators", [200, 300, 500])
-        learning_rate = trial.suggest_categorical("learning_rate", [0.01, 0.05, 0.1])
-        max_depth = trial.suggest_categorical("max_depth", [3, 5, 7])
-        subsample = trial.suggest_categorical("subsample", [0.8, 1.0])
+        n_estimators = trial.suggest_categorical("n_estimators", Config.XGB_N_ESTIMATORS_OPTIONS)
+        learning_rate = trial.suggest_categorical("learning_rate", Config.XGB_LEARNING_RATE_OPTIONS)
+        max_depth = trial.suggest_categorical("max_depth", Config.XGB_MAX_DEPTH_OPTIONS)
+        subsample = trial.suggest_categorical("subsample", Config.XGB_SUBSAMPLE_OPTIONS)
 
         pipeline_xgb = Pipeline(steps=[
             ("preprocessor", tree_preprocessor),
@@ -438,16 +528,15 @@ def optimize_xgboost(X_train: pd.DataFrame, X_test: pd.DataFrame,
                 n_estimators=n_estimators, learning_rate=learning_rate,
                 max_depth=max_depth, subsample=subsample,
                 eval_metric="logloss", scale_pos_weight=round(neg_pos_ratio, 2),
-                random_state=42
+                random_state=Config.RANDOM_STATE
             ))
         ])
-
-        logger.info(f"XGB trial {trial.number}: n_estimators={n_estimators}, lr={learning_rate}, max_depth={max_depth}, subsample={subsample}")
 
         with mlflow.start_run(run_name=f"xgb_n{n_estimators}_lr{learning_rate}_trial{trial.number}", nested=True) as run:
             trial.set_user_attr("mlflow_run_id", run.info.run_id)
             mlflow.set_tag("problem_type", "classification")
             mlflow.set_tag("model_family", "xgboost")
+            mlflow.set_tag("dataset", "bank_marketing")
 
             pipeline_xgb.fit(X_train, y_train_xgb)
             y_pred = pipeline_xgb.predict(X_test)
@@ -456,10 +545,8 @@ def optimize_xgboost(X_train: pd.DataFrame, X_test: pd.DataFrame,
             f1 = f1_score(y_test_xgb, y_pred)
             auc = roc_auc_score(y_test_xgb, y_proba)
 
-            mlflow.log_metric("f1_yes", f1)
-            mlflow.log_metric("auc", auc)
+            mlflow.log_metrics({"f1": f1, "auc": auc})
 
-            logger.info(f"XGB trial {trial.number} finished: f1_yes={f1:.4f}")
             return f1
 
     study_xgb = optuna.create_study(direction="maximize")
@@ -470,11 +557,7 @@ def optimize_xgboost(X_train: pd.DataFrame, X_test: pd.DataFrame,
 
         best_params = study_xgb.best_params
         mlflow.log_params(best_params)
-        mlflow.log_metric("best_f1_yes", study_xgb.best_value)
-        
-        logger.info(f"Completed XGB HPO with {len(study_xgb.trials)} trials")
-        logger.info(f"Best F1 (XGB): {study_xgb.best_value:.4f}")
-        logger.info(f"Best Params: {best_params}")
+        mlflow.log_metric("best_f1", study_xgb.best_value)
 
     return {
         "model_type": "XGBoost",
@@ -485,25 +568,29 @@ def optimize_xgboost(X_train: pd.DataFrame, X_test: pd.DataFrame,
     }
 
 
+# ============================================================================
+# SECTION 5: PREFECT TASKS - REPORTING
+# ============================================================================
+
 @task(name="generate_report", description="Generate experiment summary report")
 def generate_report(results: list) -> str:
     """Generate final experiment report."""
-    logger = get_run_logger()
+    log = get_run_logger()
     
-    # Sort by F1 score
     results_sorted = sorted(results, key=lambda x: x["best_f1"], reverse=True)
     
     markdown_content = """
 # Bank Marketing Experiment Tracking Report
 
 ## Experiment Overview
-This report summarizes the hyperparameter optimization for bank marketing classification using Optuna + MLflow.
+Hyperparameter optimization for bank marketing classification using Optuna + MLflow.
 
 ## Models Evaluated
 
 """
     
     for i, result in enumerate(results_sorted, 1):
+        params_str = json.dumps(result['best_params'], indent=4)
         markdown_content += f"""
 ### {i}. {result['model_type']}
 
@@ -511,7 +598,9 @@ This report summarizes the hyperparameter optimization for bank marketing classi
 - **Number of Trials**: {result['study_trials']}
 - **MLflow Run ID**: {result['parent_run_id']}
 - **Best Parameters**: 
-  - {json.dumps(result['best_params'], indent=4)}
+  ```
+  {params_str}
+  ```
 
 """
     
@@ -521,158 +610,141 @@ This report summarizes the hyperparameter optimization for bank marketing classi
 ## Best Model
 **Winner: {best_model['model_type']}** with F1 Score = {best_model['best_f1']:.4f}
 
-## Next Steps
-1. Review detailed metrics in MLflow UI: http://127.0.0.1:5001
+## Recommendations
+1. Review detailed metrics in MLflow UI: {Config.MLFLOW_TRACKING_URI}
 2. Consider ensemble methods or stacking
 3. Deploy best model to production
-4. Monitor prediction drift over time
+4. Monitor prediction drift
 
 ---
 Generated by Prefect Bank Marketing Flow
 """
     
-    # Create Prefect artifact
     create_markdown_artifact(
         key="experiment-report",
         markdown=markdown_content,
         description="Complete experiment tracking report"
     )
     
-    logger.info("Report generated successfully")
+    log.info("Report generated successfully")
     
     return markdown_content
 
 
-@flow(name="Bank Marketing Experiment Tracking", description="End-to-end ML pipeline with Optuna HPO and MLflow tracking")
+# ============================================================================
+# SECTION 6: PREFECT MAIN FLOW
+# ============================================================================
+
+@flow(
+    name="Bank Marketing Experiment Tracking",
+    description="End-to-end ML pipeline with Optuna HPO and MLflow tracking"
+)
 def bank_marketing_experiment_flow(
     data_path: Optional[str] = None,
-    n_trials_per_model: int = 3
+    n_trials_per_model: int = Config.DEFAULT_N_TRIALS
 ) -> Dict:
     """
     Main Prefect flow for bank marketing experiment tracking.
     
+    Orchestrates:
+    1. Data loading and preprocessing
+    2. Feature engineering
+    3. Train/test split
+    4. Hyperparameter optimization for 3 models
+    5. Experiment tracking with MLflow
+    6. Report generation
+    
     Args:
-        data_path: Path to processed dataset. If None, searches in standard locations.
+        data_path: Path to processed dataset
         n_trials_per_model: Number of Optuna trials per model
         
     Returns:
         Dictionary with experiment results
     """
-    logger = get_run_logger()
-    logger.info("=" * 60)
-    logger.info("Starting Bank Marketing Experiment Tracking Flow")
-    logger.info("=" * 60)
+    log = get_run_logger()
+    
+    log.info("=" * 70)
+    log.info("Starting Bank Marketing Experiment Tracking Flow")
+    log.info("=" * 70)
     
     # Setup MLflow
-    setup_mlflow("bank-marketing-experiments")
+    setup_mlflow(Config.EXPERIMENT_NAMES["main"])
     
-    # 1. Load and preprocess data
+    # ====================================================================
+    # Data Pipeline
+    # ====================================================================
+    log.info("\n[STEP 1/6] Loading and preprocessing data...")
     df = load_and_preprocess_data(data_path)
     
-    # 2. Feature engineering
+    log.info("[STEP 2/6] Feature engineering...")
     df = feature_engineering(df)
     
-    # 3. Prepare data splits and features
-    X_train, X_test, y_train, y_test, numeric_features, categorical_features, binary_features = prepare_data(df)
+    log.info("[STEP 3/6] Preparing train/test split...")
+    X_train, X_test, y_train, y_test, numeric_feat, categorical_feat, binary_feat = prepare_data(df)
     
-    # 4. Create preprocessing pipelines
-    lr_preprocessor, tree_preprocessor = create_preprocessing_pipelines(numeric_features, categorical_features)
+    log.info("[STEP 4/6] Creating preprocessing pipelines...")
+    lr_preprocessor, tree_preprocessor = create_preprocessing_pipelines(numeric_feat, categorical_feat)
     
-    # 5. Calculate class ratio for XGBoost
+    # ====================================================================
+    # Model Optimization
+    # ====================================================================
+    log.info("\n[STEP 5/6] Hyperparameter Optimization...")
+    
     neg_pos_ratio = (y_train == "no").sum() / (y_train == "yes").sum()
+    log.info(f"  Class ratio: {neg_pos_ratio:.2f}")
     
-    # 6. Optimize models
     lr_results = optimize_logistic_regression(
         X_train, X_test, y_train, y_test, lr_preprocessor,
-        numeric_features, categorical_features, binary_features,
-        n_trials=n_trials_per_model
+        numeric_feat, categorical_feat, binary_feat, n_trials=n_trials_per_model
     )
     
     rf_results = optimize_random_forest(
         X_train, X_test, y_train, y_test, tree_preprocessor,
-        numeric_features, categorical_features, binary_features,
-        n_trials=n_trials_per_model
+        numeric_feat, categorical_feat, binary_feat, n_trials=n_trials_per_model
     )
     
     xgb_results = optimize_xgboost(
         X_train, X_test, y_train, y_test, tree_preprocessor,
-        numeric_features, categorical_features, binary_features,
-        neg_pos_ratio, n_trials=n_trials_per_model
+        numeric_feat, categorical_feat, binary_feat, neg_pos_ratio,
+        n_trials=n_trials_per_model
     )
     
-    # 7. Generate report
+    # ====================================================================
+    # Results & Reporting
+    # ====================================================================
+    log.info("\n[STEP 6/6] Generating report...")
+    
     all_results = [lr_results, rf_results, xgb_results]
-    report = generate_report(all_results)
+    best_model = max(all_results, key=lambda x: x["best_f1"])
     
-    # Create summary artifact
-    summary_data = [
-        ["Model", "Best F1", "Trials", "Run ID"],
-        [lr_results["model_type"], f"{lr_results['best_f1']:.4f}", 
-         str(lr_results["study_trials"]), lr_results["parent_run_id"][:8]],
-        [rf_results["model_type"], f"{rf_results['best_f1']:.4f}", 
-         str(rf_results["study_trials"]), rf_results["parent_run_id"][:8]],
-        [xgb_results["model_type"], f"{xgb_results['best_f1']:.4f}", 
-         str(xgb_results["study_trials"]), xgb_results["parent_run_id"][:8]],
-    ]
+    generate_report(all_results)
     
-    create_table_artifact(
-        key="experiment-summary",
-        table=summary_data,
-        description="Experiment summary with all model results"
-    )
-    
-    logger.info("=" * 60)
-    logger.info("Flow completed successfully!")
-    logger.info("=" * 60)
+    log.info("\n" + "=" * 70)
+    log.info("✅ Flow Completed!")
+    log.info("=" * 70)
+    log.info(f"\n🏆 BEST MODEL: {best_model['model_type']} (F1 = {best_model['best_f1']:.4f})")
+    log.info(f"\n📊 MLflow UI: {Config.MLFLOW_TRACKING_URI}")
+    log.info("\n📋 Results:")
+    for result in sorted(all_results, key=lambda x: x["best_f1"], reverse=True):
+        log.info(f"  - {result['model_type']}: F1 = {result['best_f1']:.4f}")
     
     return {
-        "logistic_regression": lr_results,
-        "random_forest": rf_results,
-        "xgboost": xgb_results,
-        "best_model": sorted(all_results, key=lambda x: x["best_f1"], reverse=True)[0]
+        "all_results": all_results,
+        "best_model": best_model
     }
 
 
+# ============================================================================
+# SECTION 7: MAIN ENTRY POINT
+# ============================================================================
+
 if __name__ == "__main__":
-    import argparse
+    """Run the flow locally."""
+    result = bank_marketing_experiment_flow(n_trials_per_model=3)
     
-    parser = argparse.ArgumentParser(
-        description="Bank Marketing Experiment Tracking with Optuna"
-    )
-    parser.add_argument(
-        "--data-path",
-        type=str,
-        default=None,
-        help="Path to processed dataset (if None, searches in standard locations)"
-    )
-    parser.add_argument(
-        "--n-trials",
-        type=int,
-        default=3,
-        help="Number of Optuna trials per model"
-    )
-    parser.add_argument(
-        "--mlflow-uri",
-        type=str,
-        help="MLflow tracking URI"
-    )
-    args = parser.parse_args()
-    
-    # Override MLflow URI if provided
-    if args.mlflow_uri:
-        os.environ["MLFLOW_TRACKING_URI"] = args.mlflow_uri
-    
-    try:
-        results = bank_marketing_experiment_flow(
-            data_path=args.data_path,
-            n_trials_per_model=args.n_trials
-        )
-        
-        print("\n✅ Experiment completed successfully!")
-        print(f"🏆 Best Model: {results['best_model']['model_type']}")
-        print(f"📊 Best F1 Score: {results['best_model']['best_f1']:.4f}")
-        print(f"🔗 MLflow Run ID: {results['best_model']['parent_run_id']}")
-        
-    except Exception as e:
-        logger.error(f"Flow failed: {e}")
-        raise
+    print("\n" + "="*70)
+    print("FINAL RESULTS")
+    print("="*70)
+    print(f"Best Model: {result['best_model']['model_type']}")
+    print(f"Best F1 Score: {result['best_model']['best_f1']:.4f}")
+    print(f"\nView experiments at: {Config.MLFLOW_TRACKING_URI}")
