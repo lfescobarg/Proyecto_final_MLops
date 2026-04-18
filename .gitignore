@@ -1,4 +1,12 @@
+# Entorno virtual
 .venv/
 __pycache__/
 *.pyc
-.ipynb_checkpoints/
+
+# Datos
+data/processed/dataset.parquet
+model.pkl 
+
+# MLflow
+mlruns/
+mlflow.db

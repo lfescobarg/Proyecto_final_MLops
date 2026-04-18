@@ -1,0 +1,413 @@
+<!doctype html>
+<html lang="es">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Bank Marketing Predictor</title>
+    <style>
+      :root {
+        --bg: #ffffff;
+        --panel: #f9f9f9;
+        --ink: #0d0d0d;
+        --muted: #6b7280;
+        --accent: #0d0d0d;
+        --accent-2: #d97706;
+        --border: #e2e2e2;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        font-family: "Manrope", sans-serif;
+        background: var(--bg);
+        color: var(--ink);
+      }
+
+      .page {
+        max-width: 1100px;
+        margin: 0 auto;
+        padding: 40px 20px 60px;
+      }
+
+      .hero {
+        margin-bottom: 32px;
+      }
+
+      .eyebrow {
+        text-transform: uppercase;
+        letter-spacing: 0.18em;
+        font-size: 11px;
+        color: var(--muted);
+        margin-bottom: 12px;
+        display: flex;
+        align-items: center;
+        gap: 8px;
+      }
+
+      .eyebrow::before {
+        content: "";
+        display: inline-block;
+        width: 24px;
+        height: 1.5px;
+        background: var(--muted);
+      }
+
+      h1 {
+        margin: 0 0 12px;
+        font-family: "Instrument Serif", serif;
+        font-size: clamp(40px, 6vw, 72px);
+        line-height: 1;
+        letter-spacing: -0.02em;
+      }
+
+      h1 em {
+        font-style: italic;
+        text-decoration: underline;
+        text-underline-offset: 6px;
+      }
+
+      .subtitle {
+        max-width: 600px;
+        color: var(--muted);
+        font-size: 16px;
+        line-height: 1.6;
+      }
+
+      .grid {
+        display: grid;
+        grid-template-columns: 2fr 1fr;
+        gap: 16px;
+      }
+
+      .card {
+        background: var(--panel);
+        border: 1px solid var(--border);
+        border-radius: 20px;
+        padding: 24px;
+      }
+
+      form {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 14px;
+      }
+
+      .full {
+        grid-column: 1 / -1;
+      }
+
+      label {
+        display: block;
+        margin-bottom: 5px;
+        font-size: 12px;
+        font-weight: 600;
+        color: var(--muted);
+        text-transform: uppercase;
+        letter-spacing: 0.08em;
+      }
+
+      input,
+      select {
+        width: 100%;
+        border-radius: 10px;
+        border: 1px solid var(--border);
+        padding: 11px 13px;
+        font: inherit;
+        font-size: 14px;
+        background: #fff;
+        color: var(--ink);
+        transition: border-color 0.2s;
+      }
+
+      input:focus,
+      select:focus {
+        outline: none;
+        border-color: var(--ink);
+      }
+
+      button {
+        width: 100%;
+        border-radius: 10px;
+        border: none;
+        padding: 14px;
+        font: inherit;
+        font-size: 14px;
+        font-weight: 700;
+        background: var(--ink);
+        color: #fff;
+        cursor: pointer;
+        letter-spacing: 0.04em;
+        transition:
+          background 0.2s,
+          transform 0.1s;
+      }
+
+      button:hover {
+        background: var(--accent-hover);
+      }
+      button:active {
+        transform: scale(0.99);
+      }
+
+      .result {
+        min-height: 200px;
+        display: flex;
+        flex-direction: column;
+        gap: 12px;
+      }
+
+      .pill {
+        display: inline-block;
+        padding: 5px 12px;
+        border-radius: 999px;
+        border: 1px solid var(--border);
+        font-size: 11px;
+        font-weight: 700;
+        letter-spacing: 0.1em;
+        text-transform: uppercase;
+        color: var(--muted);
+        width: fit-content;
+      }
+
+      .status {
+        font-family: "Instrument Serif", serif;
+        font-size: 42px;
+        line-height: 1;
+        margin: 4px 0 0;
+      }
+
+      .prob {
+        font-size: 18px;
+        color: var(--muted);
+      }
+
+      .hint {
+        color: var(--muted);
+        line-height: 1.6;
+        font-size: 14px;
+      }
+
+      .error {
+        color: #c0392b;
+        font-weight: 700;
+        font-size: 14px;
+      }
+
+      @media (max-width: 860px) {
+        .grid {
+          grid-template-columns: 1fr;
+        }
+
+        form {
+          grid-template-columns: 1fr;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <div class="page">
+      <section class="hero">
+        <div class="eyebrow">FastAPI + MLflow + Docker</div>
+        <h1>Bank Marketing<br />Predictor</h1>
+        <p class="subtitle">
+          Completa los datos del cliente y consulta si el modelo de Random
+          Forest estima probabilidad de suscripción al depósito a plazo.
+        </p>
+      </section>
+
+      <section class="grid">
+        <div class="card">
+          <form id="predict-form">
+            <div>
+              <label for="age">Edad</label>
+              <input id="age" name="age" type="number" value="35" required />
+            </div>
+            <div>
+              <label for="balance">Balance</label>
+              <input
+                id="balance"
+                name="balance"
+                type="number"
+                value="1200"
+                required
+              />
+            </div>
+            <div>
+              <label for="job">Job</label>
+              <select id="job" name="job">
+                <option>technician</option>
+                <option>admin.</option>
+                <option>services</option>
+                <option>management</option>
+                <option>blue-collar</option>
+              </select>
+            </div>
+            <div>
+              <label for="marital">Marital</label>
+              <select id="marital" name="marital">
+                <option>single</option>
+                <option>married</option>
+                <option>divorced</option>
+              </select>
+            </div>
+            <div>
+              <label for="education">Education</label>
+              <select id="education" name="education">
+                <option>tertiary</option>
+                <option>secondary</option>
+                <option>primary</option>
+                <option>unknown</option>
+              </select>
+            </div>
+            <div>
+              <label for="contact">Contact</label>
+              <select id="contact" name="contact">
+                <option>cellular</option>
+                <option>telephone</option>
+                <option>unknown</option>
+              </select>
+            </div>
+            <div>
+              <label for="default">Default</label>
+              <select id="default" name="default">
+                <option>no</option>
+                <option>yes</option>
+              </select>
+            </div>
+            <div>
+              <label for="housing">Housing</label>
+              <select id="housing" name="housing">
+                <option>yes</option>
+                <option>no</option>
+              </select>
+            </div>
+            <div>
+              <label for="loan">Loan</label>
+              <select id="loan" name="loan">
+                <option>no</option>
+                <option>yes</option>
+              </select>
+            </div>
+            <div>
+              <label for="month">Month</label>
+              <select id="month" name="month">
+                <option>may</option>
+                <option>jun</option>
+                <option>jul</option>
+                <option>aug</option>
+                <option>sep</option>
+                <option>oct</option>
+                <option>nov</option>
+                <option>dec</option>
+              </select>
+            </div>
+            <div>
+              <label for="campaign">Campaign</label>
+              <input
+                id="campaign"
+                name="campaign"
+                type="number"
+                value="2"
+                required
+              />
+            </div>
+            <div>
+              <label for="pdays">Pdays</label>
+              <input
+                id="pdays"
+                name="pdays"
+                type="number"
+                value="999"
+                required
+              />
+            </div>
+            <div>
+              <label for="previous">Previous</label>
+              <input
+                id="previous"
+                name="previous"
+                type="number"
+                value="0"
+                required
+              />
+            </div>
+            <div>
+              <label for="poutcome">Poutcome</label>
+              <select id="poutcome" name="poutcome">
+                <option>unknown</option>
+                <option>success</option>
+                <option>failure</option>
+                <option>other</option>
+              </select>
+            </div>
+            <div class="full">
+              <button type="submit">Predict Subscription</button>
+            </div>
+          </form>
+        </div>
+
+        <aside class="card result">
+          <span class="pill">Live prediction</span>
+          <div id="result-content" class="hint">
+            Envía el formulario para ver la predicción y la probabilidad
+            estimada.
+          </div>
+        </aside>
+      </section>
+    </div>
+
+    <script>
+      const form = document.getElementById("predict-form");
+      const resultContent = document.getElementById("result-content");
+
+      form.addEventListener("submit", async (event) => {
+        event.preventDefault();
+
+        const formData = new FormData(form);
+        const payload = {
+          age: Number(formData.get("age")),
+          job: formData.get("job"),
+          marital: formData.get("marital"),
+          education: formData.get("education"),
+          default: formData.get("default"),
+          balance: Number(formData.get("balance")),
+          housing: formData.get("housing"),
+          loan: formData.get("loan"),
+          contact: formData.get("contact"),
+          campaign: Number(formData.get("campaign")),
+          pdays: Number(formData.get("pdays")),
+          previous: Number(formData.get("previous")),
+          poutcome: formData.get("poutcome"),
+          month: formData.get("month"),
+        };
+
+        resultContent.innerHTML = "Calculando prediccion...";
+
+        try {
+          const response = await fetch("/predict", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(payload),
+          });
+
+          const data = await response.json();
+
+          if (!response.ok) {
+            throw new Error(data.detail || "Error al predecir.");
+          }
+
+          resultContent.innerHTML = `
+                    <div class="status">${data.subscribed ? "Likely Yes" : "Likely No"}</div>
+                    <div class="prob">Probability yes: ${data.probability_yes}</div>
+                    <div class="hint">Prediction label: ${data.prediction}</div>
+                `;
+        } catch (error) {
+          resultContent.innerHTML = `<div class="error">${error.message}</div>`;
+        }
+      });
+    </script>
+  </body>
+</html>
